@@ -38,17 +38,17 @@ ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 | 命令 | 参数 |
 |---|---|
 | `setup.sh vps` | `--name vps` 本机 tailnet 名 · `--peer internal` 等待的对端名 · `--user` 内部服务器用户名 · `--alias internal` ssh 别名 · `--timeout 秒` |
-| `setup.sh internal` | `--name internal` · `--pubkey '...'` · `--user` 授权给哪个本地用户(默认当前用户) · `--rootless` 无 root/sudo 模式 |
+| `setup.sh internal` | `--name internal` · `--pubkey '...'` · `--user` 授权给哪个本地用户(默认当前用户) · `--system` 系统级安装(需 root/sudo;默认无需 root) |
 
 自建 Headscale:`export TS_LOGIN_SERVER=https://headscale.example.com` 后再运行。
 脚本可重复执行(幂等)。
 
-## 没有 root / sudo(`--rootless`)
+## 无 root 模式(internal 默认)
 
-内部服务器没有 sudo 时,加 `--rootless`:
+`setup.sh internal` 默认**不需要 root/sudo**:
 
 ```bash
-./setup.sh internal --rootless --pubkey 'ssh-ed25519 AAAA...'
+./setup.sh internal --pubkey 'ssh-ed25519 AAAA...'
 ```
 
 - 下载 tailscale 静态二进制到 `~/.local/share/tailnet-bridge`,以 **userspace 网络模式**运行(无需 TUN/root)。
@@ -56,7 +56,8 @@ ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 - 通过 `tailscale serve` 把 tailnet:22 转发到本机:本机 sshd 在 22 端口则直接转发,否则自己起一个仅监听 127.0.0.1:2222 的用户态 sshd。
 - 公钥的来源限制为回环地址(`from="127.0.0.1,::1"`),因为转发后 sshd 看到的来源是本机。
 - 前提:机器上已有 `curl`、`python3`,以及(若系统 sshd 未运行)`/usr/sbin/sshd`;`tmux` 缺失只会提示。
-- VPS 端不需要任何改动,仍用 `./setup.sh vps`。
+- 有 root/sudo 且想要系统级安装(TUN 网卡、系统服务、自动装 sshd/tmux)时加 `--system`。
+- VPS 端仍用 `./setup.sh vps`(VPS 需要 root/sudo)。
 
 ## 安全说明
 

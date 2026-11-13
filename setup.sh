@@ -17,14 +17,14 @@ warn() { printf '\033[1;33m[bridge]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bridge] 错误:\033[0m %s\n' "$*" >&2; exit 1; }
 
 ROOTLESS=0
-RL_DIR="${TNB_HOME:-$HOME/.local/share/tailnet-bridge}"   # --rootless 模式的安装目录
+RL_DIR="${TNB_HOME:-$HOME/.local/share/tailnet-bridge}"   # 无 root 模式的安装目录
 RL_SOCK="$RL_DIR/tailscaled.sock"
 
 SUDO=""
 if [[ ${EUID:-$(id -u)} -ne 0 ]] && command -v sudo >/dev/null; then SUDO="sudo"; fi
 
 require_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 || -n "$SUDO" ]] || die "需要 root 或 sudo;没有 sudo 的机器请加 --rootless"
+  [[ ${EUID:-$(id -u)} -eq 0 || -n "$SUDO" ]] || die "需要 root 或 sudo"
 }
 
 ts() {
@@ -36,9 +36,10 @@ usage() {
   cat <<'EOF'
 用法:
   ./setup.sh vps      [--name vps] [--peer internal] [--user 用户名] [--alias internal] [--timeout 秒]
-  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--user 用户名] [--rootless]
+  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--user 用户名] [--system]
 
-  --rootless  无 root/sudo 时使用: tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge
+  internal 默认无需 root/sudo: tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge
+  --system    改为系统级安装(需要 root/sudo): 安装软件包、systemd 服务、TUN 网卡
 
 环境变量:
   TS_AUTHKEY        Tailscale auth key(可选,免浏览器登录)
@@ -60,7 +61,7 @@ need_basics() {
   local c
   for c in curl python3; do
     command -v "$c" >/dev/null && continue
-    (( ROOTLESS )) && die "--rootless 模式无法安装软件,请先让管理员安装: $c"
+    (( ROOTLESS )) && die "无 root 模式无法安装软件,请先让管理员安装: $c(或改用 --system)"
     pkg_install "$c"
   done
 }
@@ -230,12 +231,14 @@ EOF
 # ---------- 内部服务器 ----------
 cmd_internal() {
   local name="internal" pubkey="" user=""
+  ROOTLESS=1   # 默认无 root
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="$2"; shift 2;;
       --pubkey) pubkey="$2"; shift 2;;
       --user) user="$2"; shift 2;;
-      --rootless) ROOTLESS=1; shift;;
+      --system) ROOTLESS=0; shift;;
+      --rootless) ROOTLESS=1; shift;;   # 兼容旧参数(现为默认)
       -h|--help) usage; exit 0;;
       *) die "未知参数: $1";;
     esac
@@ -269,13 +272,13 @@ cmd_internal() {
   if [[ -n "$pubkey" ]]; then
     authorize_key "$user" "$pubkey" "$from"
   else
-    warn "未提供公钥,VPS 将无法免密登录。可稍后重跑: ./setup.sh internal $( ((ROOTLESS)) && echo "--rootless ")--pubkey '...'"
+    warn "未提供公钥,VPS 将无法免密登录。可稍后重跑: ./setup.sh internal $( ((ROOTLESS)) || echo "--system ")--pubkey '...'"
   fi
 
   local ip; ip="$(ts ip -4 2>/dev/null | head -1 || true)"
   cat <<EOF
 
-完成。本机 tailnet 地址: ${ip:-?}  主机名: $name  用户: $user$( ((ROOTLESS)) && echo '  (rootless/userspace 模式)')
+完成。本机 tailnet 地址: ${ip:-?}  主机名: $name  用户: $user$( ((ROOTLESS)) && echo '  (无 root / userspace 模式)')
 - 未开放任何公网入站端口;SSH 公钥仅允许来自 $( ((ROOTLESS)) && echo 'tailnet 转发(本机回环)' || echo 'tailnet(100.64.0.0/10)')的连接。
 - 回到 VPS,等待脚本提示 "内部服务器已连通"。
 EOF
