@@ -16,19 +16,29 @@ log()  { printf '\033[1;34m[bridge]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bridge]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bridge] 错误:\033[0m %s\n' "$*" >&2; exit 1; }
 
-SUDO=""
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  command -v sudo >/dev/null || die "需要 root 或 sudo"
-  SUDO="sudo"
-fi
+ROOTLESS=0
+RL_DIR="${TNB_HOME:-$HOME/.local/share/tailnet-bridge}"   # --rootless 模式的安装目录
+RL_SOCK="$RL_DIR/tailscaled.sock"
 
-ts() { $SUDO tailscale "$@"; }
+SUDO=""
+if [[ ${EUID:-$(id -u)} -ne 0 ]] && command -v sudo >/dev/null; then SUDO="sudo"; fi
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 || -n "$SUDO" ]] || die "需要 root 或 sudo;没有 sudo 的机器请加 --rootless"
+}
+
+ts() {
+  if (( ROOTLESS )); then "$RL_DIR/bin/tailscale" --socket="$RL_SOCK" "$@"
+  else $SUDO tailscale "$@"; fi
+}
 
 usage() {
   cat <<'EOF'
 用法:
   ./setup.sh vps      [--name vps] [--peer internal] [--user 用户名] [--alias internal] [--timeout 秒]
-  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--user 用户名]
+  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--user 用户名] [--rootless]
+
+  --rootless  无 root/sudo 时使用: tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge
 
 环境变量:
   TS_AUTHKEY        Tailscale auth key(可选,免浏览器登录)
@@ -47,8 +57,12 @@ pkg_install() {
 }
 
 need_basics() {
-  command -v curl    >/dev/null || pkg_install curl
-  command -v python3 >/dev/null || pkg_install python3
+  local c
+  for c in curl python3; do
+    command -v "$c" >/dev/null && continue
+    (( ROOTLESS )) && die "--rootless 模式无法安装软件,请先让管理员安装: $c"
+    pkg_install "$c"
+  done
 }
 
 install_tailscale() {
@@ -123,6 +137,7 @@ cmd_vps() {
     user="${user:-$USER}"
   fi
 
+  require_root
   need_basics
   install_tailscale
   tailscale_login "$name"
@@ -220,35 +235,48 @@ cmd_internal() {
       --name) name="$2"; shift 2;;
       --pubkey) pubkey="$2"; shift 2;;
       --user) user="$2"; shift 2;;
+      --rootless) ROOTLESS=1; shift;;
       -h|--help) usage; exit 0;;
       *) die "未知参数: $1";;
     esac
   done
-  user="${user:-${SUDO_USER:-$(id -un)}}"
-  [[ "$user" == "root" ]] && warn "将为 root 用户授权密钥;建议改用普通用户运行或指定 --user"
+  if (( ROOTLESS )); then
+    user="$(id -un)"
+  else
+    require_root
+    user="${user:-${SUDO_USER:-$(id -un)}}"
+    [[ "$user" == "root" ]] && warn "将为 root 用户授权密钥;建议改用普通用户运行或指定 --user"
+  fi
   id "$user" >/dev/null 2>&1 || die "用户不存在: $user"
 
   need_basics
-  install_tailscale
+  if (( ROOTLESS )); then rootless_start_tailscaled; else install_tailscale; fi
   tailscale_login "$name"
 
-  ensure_sshd
-  command -v tmux >/dev/null || { log "安装 tmux"; pkg_install tmux || warn "tmux 安装失败,请手动安装"; }
+  local from="$TAILNET_FROM"
+  if (( ROOTLESS )); then
+    rootless_expose_ssh
+    from="127.0.0.1,::1"   # serve 转发到本机,sshd 看到的来源是回环地址
+    command -v tmux >/dev/null || warn "未找到 tmux(无法替你安装),请让管理员安装,或改用 screen"
+  else
+    ensure_sshd
+    command -v tmux >/dev/null || { log "安装 tmux"; pkg_install tmux || warn "tmux 安装失败,请手动安装"; }
+  fi
 
   if [[ -z "$pubkey" && -t 0 ]]; then
     read -r -p "粘贴 VPS 脚本打印的公钥(留空跳过): " pubkey
   fi
   if [[ -n "$pubkey" ]]; then
-    authorize_key "$user" "$pubkey"
+    authorize_key "$user" "$pubkey" "$from"
   else
-    warn "未提供公钥,VPS 将无法免密登录。可稍后重跑: ./setup.sh internal --pubkey '...'"
+    warn "未提供公钥,VPS 将无法免密登录。可稍后重跑: ./setup.sh internal $( ((ROOTLESS)) && echo "--rootless ")--pubkey '...'"
   fi
 
   local ip; ip="$(ts ip -4 2>/dev/null | head -1 || true)"
   cat <<EOF
 
-完成。本机 tailnet 地址: ${ip:-?}  主机名: $name  用户: $user
-- 未开放任何公网入站端口;SSH 公钥仅允许来自 tailnet(100.64.0.0/10)的连接。
+完成。本机 tailnet 地址: ${ip:-?}  主机名: $name  用户: $user$( ((ROOTLESS)) && echo '  (rootless/userspace 模式)')
+- 未开放任何公网入站端口;SSH 公钥仅允许来自 $( ((ROOTLESS)) && echo 'tailnet 转发(本机回环)' || echo 'tailnet(100.64.0.0/10)')的连接。
 - 回到 VPS,等待脚本提示 "内部服务器已连通"。
 EOF
 }
@@ -266,20 +294,123 @@ ensure_sshd() {
 }
 
 authorize_key() {
-  local user="$1" key="$2" home dir file blob
+  local user="$1" key="$2" from="${3:-$TAILNET_FROM}" home dir file blob
   [[ "$key" =~ ^(ssh-|ecdsa-|sk-) ]] || die "公钥格式不正确"
   home="$(getent passwd "$user" | cut -d: -f6)"
   dir="$home/.ssh"; file="$dir/authorized_keys"
   blob="$(awk '{print $2}' <<<"$key")"
   $SUDO install -d -m 700 -o "$user" "$dir"
   $SUDO touch "$file"
-  if $SUDO grep -qF "$blob" "$file"; then
-    log "公钥已存在于 $file"
-  else
-    printf 'from="%s" %s\n' "$TAILNET_FROM" "$key" | $SUDO tee -a "$file" >/dev/null
-    log "已授权公钥(仅限 tailnet 来源)→ $file"
-  fi
+  # 先去掉同一把密钥的旧行再写入,保证重复运行只留一行且来源限制是最新的
+  { $SUDO grep -vF -- "$blob" "$file" || true; printf 'from="%s" %s\n' "$from" "$key"; } | $SUDO tee "$file.tnb" >/dev/null
+  $SUDO mv "$file.tnb" "$file"
   $SUDO chown "$user" "$file"; $SUDO chmod 600 "$file"
+  log "已授权公钥(来源限制: $from)→ $file"
+}
+
+# ---------- rootless(无 root/sudo) ----------
+# 以后台服务运行: 优先 systemd --user,否则 nohup
+rl_run_service() {
+  local name="$1"; shift
+  local cmd="$*"
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    local d="$HOME/.config/systemd/user"; mkdir -p "$d"
+    cat >"$d/tnb-$name.service" <<EOF
+[Unit]
+Description=tailnet-bridge $name
+[Service]
+ExecStart=$cmd
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable "tnb-$name.service" >/dev/null 2>&1 || true
+    systemctl --user restart "tnb-$name.service"
+    if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q yes; then
+      loginctl enable-linger "$(id -un)" 2>/dev/null \
+        || warn "无法启用 linger:你退出登录后服务可能停止,需管理员执行 'loginctl enable-linger $(id -un)'"
+    fi
+  else
+    warn "systemd --user 不可用,改用 nohup 后台进程(机器重启后需重新运行本脚本)"
+    local pidf="$RL_DIR/$name.pid"
+    if [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+      kill "$(cat "$pidf")" 2>/dev/null || true; sleep 1
+    fi
+    setsid nohup bash -c "exec $cmd" >"$RL_DIR/$name.log" 2>&1 </dev/null &
+    echo $! >"$pidf"
+  fi
+}
+
+rootless_install_tailscale() {
+  [[ -x "$RL_DIR/bin/tailscaled" && -x "$RL_DIR/bin/tailscale" ]] && return 0
+  local arch meta file tmp
+  case "$(uname -m)" in
+    x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; armv6l|armv7l) arch=arm;; i?86) arch=386;;
+    *) die "不支持的架构: $(uname -m)";;
+  esac
+  log "下载 tailscale 静态二进制 ($arch) ..."
+  meta="$(curl -fsSL 'https://pkgs.tailscale.com/stable/?mode=json')" || die "无法获取 tailscale 版本信息"
+  file="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["Tarballs"][sys.argv[1]])' "$arch" <<<"$meta")" \
+    || die "找不到适用于 $arch 的 tailscale 压缩包"
+  tmp="$(mktemp -d)"
+  curl -fsSL "https://pkgs.tailscale.com/stable/$file" -o "$tmp/ts.tgz" || die "下载失败"
+  mkdir "$tmp/x" && tar -xzf "$tmp/ts.tgz" --strip-components=1 -C "$tmp/x"
+  install -m 755 "$tmp/x/tailscale" "$tmp/x/tailscaled" "$RL_DIR/bin/"
+  rm -rf "$tmp"
+}
+
+rootless_start_tailscaled() {
+  mkdir -p "$RL_DIR/bin" && chmod 700 "$RL_DIR"
+  rootless_install_tailscale
+  log "启动 tailscaled(userspace 网络模式,无需 root)"
+  rl_run_service tailscaled "$RL_DIR/bin/tailscaled --tun=userspace-networking --state=$RL_DIR/tailscaled.state --socket=$RL_SOCK"
+  local i
+  for i in $(seq 1 20); do
+    [[ -n "$(backend_state)" ]] && return 0
+    sleep 1
+  done
+  die "tailscaled 未就绪,查看 $RL_DIR/tailscaled.log 或 journalctl --user -u tnb-tailscaled"
+}
+
+# 无 root 时自己跑一个仅监听 127.0.0.1 的用户态 sshd
+rootless_start_sshd() {
+  local port="$1" sshd d="$RL_DIR/ssh"
+  sshd="$(command -v sshd || true)"
+  if [[ -z "$sshd" && -x /usr/sbin/sshd ]]; then sshd=/usr/sbin/sshd; fi
+  [[ -n "$sshd" ]] || die "本机没有 sshd 可用,请让管理员安装 openssh-server"
+  mkdir -p "$d" && chmod 700 "$d"
+  [[ -f "$d/hostkey" ]] || ssh-keygen -q -t ed25519 -N "" -f "$d/hostkey"
+  cat >"$d/sshd_config" <<EOF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $d/hostkey
+PidFile $d/sshd.pid
+AuthorizedKeysFile $HOME/.ssh/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+EOF
+  "$sshd" -t -f "$d/sshd_config" || die "sshd 配置检查失败"
+  log "启动用户态 sshd (127.0.0.1:$port)"
+  rl_run_service sshd "$sshd -D -e -f $d/sshd_config"
+}
+
+# 让 tailnet:22 指向本机 sshd(系统 sshd 优先,没有则用用户态 sshd)
+rootless_expose_ssh() {
+  local port=22
+  if (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null; then
+    log "检测到本机 sshd 监听 22,直接转发"
+  else
+    port=2222
+    rootless_start_sshd "$port"
+  fi
+  log "tailscale serve: tailnet:22 → localhost:$port"
+  ts serve --bg --tcp=22 "tcp://localhost:$port" >/dev/null 2>&1 \
+    || ts serve --bg tcp:22 "tcp://localhost:$port" >/dev/null 2>&1 \
+    || die "tailscale serve 失败(需要较新的 tailscale);可手动运行: tailscale serve --bg --tcp=22 tcp://localhost:$port"
 }
 
 main() {
