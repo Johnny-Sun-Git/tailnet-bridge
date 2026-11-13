@@ -167,7 +167,7 @@ EOF
   log "等待内部服务器 \"$peer\" 加入 tailnet 并可 SSH 登录(用户 $user)... Ctrl-C 可中止,重跑本命令即可继续"
 
   local sendf; sendf="$(mktemp -d)/tnb-$name.pub"; cp "$key.pub" "$sendf"
-  local start=$SECONDS ip="" state="" last="" msg err serr tick=0
+  local start=$SECONDS ip="" state="" last="" msg err serr tick=0 asked=0 ans
   while :; do
     read -r state ip <<<"$(peer_info "$peer")" || true
     if [[ -z "${state:-}" ]]; then
@@ -189,6 +189,15 @@ EOF
           msg="$msg(Taildrop 发送失败: $(tail -1 <<<"$serr"))"
         fi
       fi
+      # Taildrop 不可用且服务器允许密码登录时,交互式用密码一次性写入公钥
+      if (( asked == 0 )) && [[ -t 0 && -n "${serr:-}" && "$err" == *"Permission denied"* && "$err" == *password* ]]; then
+        asked=1
+        log "$msg"; last="$msg"
+        read -r -p "Taildrop 不可用。用 $user@$ip 的登录密码把公钥写入内部服务器? [Y/n] " ans
+        if [[ "${ans:-Y}" =~ ^[Yy] ]]; then
+          push_key_with_password "$user" "$ip" "$key" || warn "密码写入失败,稍后重试或在内部服务器用 --pubkey 手动授权"
+        fi
+      fi
     fi
     [[ "$msg" != "$last" ]] && { log "$msg"; last="$msg"; }
     if (( timeout > 0 && SECONDS - start > timeout )); then die "等待超时($timeout 秒)"; fi
@@ -205,6 +214,21 @@ EOF
   ssh -t $alias 'tmux new -As cc'             # 进入 tmux,在里面运行 claude
   ssh -J $alias 用户@虚拟机内网IP              # 经内部服务器跳到 qemu 虚拟机
 EOF
+}
+
+# 生成在内部服务器上执行的"幂等写入 authorized_keys"命令
+authorize_remote_cmd() {
+  local pubfile="$1" blob line
+  blob="$(awk '{print $2}' "$pubfile")"
+  line="from=\"127.0.0.1,::1,$TAILNET_FROM\" $(cat "$pubfile")"
+  printf "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; grep -qF '%s' ~/.ssh/authorized_keys || printf '%%s\\n' '%s' >> ~/.ssh/authorized_keys" "$blob" "$line"
+}
+
+push_key_with_password() {
+  local user="$1" ip="$2" key="$3"
+  ssh -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no \
+      -o StrictHostKeyChecking=accept-new -o ControlPath=none \
+      "$user@$ip" "$(authorize_remote_cmd "$key.pub")"
 }
 
 write_ssh_config() {
@@ -403,7 +427,7 @@ rootless_start_tailscaled() {
   mkdir -p "$RL_DIR/bin" && chmod 700 "$RL_DIR"
   rootless_install_tailscale
   log "启动 tailscaled(userspace 网络模式,无需 root)"
-  rl_run_service tailscaled "$RL_DIR/bin/tailscaled --tun=userspace-networking --state=$RL_DIR/tailscaled.state --socket=$RL_SOCK"
+  rl_run_service tailscaled "$RL_DIR/bin/tailscaled --tun=userspace-networking --statedir=$RL_DIR --state=$RL_DIR/tailscaled.state --socket=$RL_SOCK"
   local i
   for i in $(seq 1 20); do
     [[ -n "$(backend_state)" ]] && return 0

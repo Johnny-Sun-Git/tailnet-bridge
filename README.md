@@ -23,7 +23,7 @@ git clone <本仓库> && cd tailnet-bridge
 
 脚本会:下载并登录 Tailscale(无 root 的 userspace 模式)→ 把 tailnet:22 转发到本机 sshd → **自动接收 VPS 发来的公钥并授权**。
 公钥通过 Tailscale 文件传输(Taildrop)从 VPS 自动送达,无需复制粘贴;两台机器须登录同一个账号。
-Taildrop 不可用时,可手动:`./setup.sh internal --pubkey 'ssh-ed25519 AAAA...'`(VPS 会把这条命令打印出来)。
+Taildrop 不可用时,VPS 会询问是否用内部服务器账号的登录密码一次性写入公钥(需要内部 sshd 允许密码登录),也可手动:`./setup.sh internal --pubkey 'ssh-ed25519 AAAA...'`(VPS 会把这条命令打印出来)。
 
 **3. 回到 VPS**:检测到连通后自动写入 `~/.ssh/config`,然后:
 
