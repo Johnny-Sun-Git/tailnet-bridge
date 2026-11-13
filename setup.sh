@@ -36,7 +36,9 @@ usage() {
   cat <<'EOF'
 用法:
   ./setup.sh vps      [--name vps] [--peer internal] [--user 用户名] [--alias internal] [--timeout 秒]
-  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--user 用户名] [--system]
+  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--key-timeout 秒] [--user 用户名] [--system]
+
+  公钥默认由 VPS 通过 Tailscale 文件传输(Taildrop)自动发给 internal;--pubkey 仅作手动备选
 
   internal 默认无需 root/sudo: tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge
   --system    改为系统级安装(需要 root/sudo): 安装软件包、systemd 服务、TUN 网卡
@@ -156,13 +158,16 @@ cmd_vps() {
 
 ================ 下一步:在【内部服务器】上执行 ================
   git clone <本仓库地址> && cd tailnet-bridge
-  ./setup.sh internal --name $peer --pubkey '$pub'
+  ./setup.sh internal --name $peer
 ==============================================================
+公钥会自动通过 Tailscale 文件传输(Taildrop)发给内部服务器。
+若自动传输不可用,可手动: ./setup.sh internal --name $peer --pubkey '$pub'
 
 EOF
   log "等待内部服务器 \"$peer\" 加入 tailnet 并可 SSH 登录(用户 $user)... Ctrl-C 可中止,重跑本命令即可继续"
 
-  local start=$SECONDS ip="" state="" last="" msg err
+  local sendf; sendf="$(mktemp -d)/tnb-$name.pub"; cp "$key.pub" "$sendf"
+  local start=$SECONDS ip="" state="" last="" msg err serr tick=0
   while :; do
     read -r state ip <<<"$(peer_info "$peer")" || true
     if [[ -z "${state:-}" ]]; then
@@ -176,6 +181,14 @@ EOF
         break
       fi
       msg="⏳ $peer 在线($ip),SSH 尚不可用: $(tail -1 <<<"$err")"
+      # 每约 15 秒通过 Taildrop 发一次公钥(内部服务器收到后会自动授权)
+      if (( tick++ % 3 == 0 )); then
+        if serr="$(ts file cp "$sendf" "$peer:" 2>&1)"; then
+          msg="$msg(已通过 Taildrop 发送公钥)"
+        else
+          msg="$msg(Taildrop 发送失败: $(tail -1 <<<"$serr"))"
+        fi
+      fi
     fi
     [[ "$msg" != "$last" ]] && { log "$msg"; last="$msg"; }
     if (( timeout > 0 && SECONDS - start > timeout )); then die "等待超时($timeout 秒)"; fi
@@ -230,13 +243,14 @@ EOF
 
 # ---------- 内部服务器 ----------
 cmd_internal() {
-  local name="internal" pubkey="" user=""
+  local name="internal" pubkey="" user="" key_timeout=1800
   ROOTLESS=1   # 默认无 root
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="$2"; shift 2;;
       --pubkey) pubkey="$2"; shift 2;;
       --user) user="$2"; shift 2;;
+      --key-timeout) key_timeout="$2"; shift 2;;
       --system) ROOTLESS=0; shift;;
       --rootless) ROOTLESS=1; shift;;   # 兼容旧参数(现为默认)
       -h|--help) usage; exit 0;;
@@ -266,13 +280,13 @@ cmd_internal() {
     command -v tmux >/dev/null || { log "安装 tmux"; pkg_install tmux || warn "tmux 安装失败,请手动安装"; }
   fi
 
-  if [[ -z "$pubkey" && -t 0 ]]; then
-    read -r -p "粘贴 VPS 脚本打印的公钥(留空跳过): " pubkey
+  if [[ -z "$pubkey" ]]; then
+    pubkey="$(receive_pubkey "$key_timeout")" || true
   fi
   if [[ -n "$pubkey" ]]; then
     authorize_key "$user" "$pubkey" "$from"
   else
-    warn "未提供公钥,VPS 将无法免密登录。可稍后重跑: ./setup.sh internal $( ((ROOTLESS)) || echo "--system ")--pubkey '...'"
+    warn "未收到公钥,VPS 将无法免密登录。可重跑本命令,或手动: ./setup.sh internal $( ((ROOTLESS)) || echo "--system ")--pubkey '...'"
   fi
 
   local ip; ip="$(ts ip -4 2>/dev/null | head -1 || true)"
@@ -309,6 +323,27 @@ authorize_key() {
   $SUDO mv "$file.tnb" "$file"
   $SUDO chown "$user" "$file"; $SUDO chmod 600 "$file"
   log "已授权公钥(来源限制: $from)→ $file"
+}
+
+# 通过 Taildrop 等待 VPS 发来的公钥(文件名 tnb-*.pub);成功时在 stdout 输出公钥
+receive_pubkey() {
+  local secs="$1" dir f key start=$SECONDS
+  dir="$(mktemp -d)"
+  log "等待 VPS 通过 Taildrop 发来公钥(最多 ${secs}s;Ctrl-C 后可改用 --pubkey 手动提供)..." >&2
+  while (( SECONDS - start < secs )); do
+    ts file get --conflict=overwrite "$dir" >/dev/null 2>&1 || true
+    for f in "$dir"/tnb-*.pub; do
+      [[ -f "$f" ]] || continue
+      (( $(wc -c <"$f") < 2048 )) || continue
+      key="$(head -1 "$f")"
+      if [[ "$key" =~ ^(ssh-|ecdsa-|sk-) ]]; then
+        log "已收到公钥 ($(basename "$f"))" >&2
+        printf '%s\n' "$key"; rm -rf "$dir"; return 0
+      fi
+    done
+    sleep 3
+  done
+  rm -rf "$dir"; return 1
 }
 
 # ---------- rootless(无 root/sudo) ----------

@@ -14,14 +14,16 @@ git clone <本仓库> && cd tailnet-bridge
 
 脚本会:安装并登录 Tailscale → 生成专用 SSH 密钥 → 打印要在内部服务器执行的命令 → **等待内部服务器连通**。
 
-**2. 内部服务器上**(执行 VPS 打印出来的那条命令)
+**2. 内部服务器上**(不需要 root/sudo)
 
 ```bash
 git clone <本仓库> && cd tailnet-bridge
-./setup.sh internal --pubkey 'ssh-ed25519 AAAA... tailnet-bridge@vps'
+./setup.sh internal
 ```
 
-脚本会:安装并登录 Tailscale → 确保 sshd 运行 → 安装 tmux → 授权 VPS 公钥。
+脚本会:下载并登录 Tailscale(无 root 的 userspace 模式)→ 把 tailnet:22 转发到本机 sshd → **自动接收 VPS 发来的公钥并授权**。
+公钥通过 Tailscale 文件传输(Taildrop)从 VPS 自动送达,无需复制粘贴;两台机器须登录同一个账号。
+Taildrop 不可用时,可手动:`./setup.sh internal --pubkey 'ssh-ed25519 AAAA...'`(VPS 会把这条命令打印出来)。
 
 **3. 回到 VPS**:检测到连通后自动写入 `~/.ssh/config`,然后:
 
@@ -38,7 +40,7 @@ ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 | 命令 | 参数 |
 |---|---|
 | `setup.sh vps` | `--name vps` 本机 tailnet 名 · `--peer internal` 等待的对端名 · `--user` 内部服务器用户名 · `--alias internal` ssh 别名 · `--timeout 秒` |
-| `setup.sh internal` | `--name internal` · `--pubkey '...'` · `--user` 授权给哪个本地用户(默认当前用户) · `--system` 系统级安装(需 root/sudo;默认无需 root) |
+| `setup.sh internal` | `--name internal` · `--pubkey '...'` 手动提供公钥(默认经 Taildrop 自动接收) · `--key-timeout 秒` 等公钥的时长 · `--user` 授权给哪个本地用户(默认当前用户) · `--system` 系统级安装(需 root/sudo;默认无需 root) |
 
 自建 Headscale:`export TS_LOGIN_SERVER=https://headscale.example.com` 后再运行。
 脚本可重复执行(幂等)。
@@ -64,6 +66,7 @@ ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 - 内部服务器只做出站连接,公网上看不到它;内网 IP 不会公开(tailnet 内使用 100.x 虚拟地址)。
 - Tailscale 控制面能看到设备名、账号、出口 IP 等元数据,看不到流量内容。要完全自控请用 Headscale。
 - 授权的公钥带有 `from="100.64.0.0/10,..."`,即使泄露也只能在 tailnet 内使用。
+- 公钥经 Taildrop 只在你自己的设备间传输,且只接受名为 `tnb-*.pub`、格式合法的公钥文件;私钥始终留在 VPS,不会传输。
 - VPS 专用密钥 `~/.ssh/id_ed25519_tailnet-bridge` 无口令,便于 Claude Code 自动化,请只用于此用途。
 
 ## qemu 虚拟机
