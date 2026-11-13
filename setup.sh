@@ -282,6 +282,7 @@ cmd_internal() {
     esac
   done
   if (( ROOTLESS )); then
+    SUDO=""   # 无 root 模式绝不调用 sudo
     user="$(id -un)"
   else
     require_root
