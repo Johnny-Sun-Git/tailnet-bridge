@@ -10,6 +10,8 @@ set -euo pipefail
 TS_LOGIN_SERVER="${TS_LOGIN_SERVER:-}"   # 使用 Headscale 时填写
 TS_AUTHKEY="${TS_AUTHKEY:-}"             # 可选: 免浏览器登录
 KEY_NAME="id_ed25519_tailnet-bridge"
+REPO_URL_DEFAULT="https://github.com/Johnny-Sun-Git/tailnet-bridge.git"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAILNET_FROM='100.64.0.0/10,fd7a:115c:a1e0::/48'
 
 log()  { printf '\033[1;34m[bridge]\033[0m %s\n' "$*"; }
@@ -35,13 +37,16 @@ ts() {
 usage() {
   cat <<'EOF'
 用法:
-  ./setup.sh vps      [--name vps] [--peer internal] [--user 用户名] [--alias internal] [--timeout 秒]
-  ./setup.sh internal [--name internal] [--pubkey 'ssh-ed25519 ...'] [--key-timeout 秒] [--user 用户名] [--system]
+  ./setup.sh vps      [--user 内部服务器用户名] [--name vps] [--peer internal] [--alias internal]
+                      [--timeout 秒] [--no-check]
+  ./setup.sh internal [--pubkey 'ssh-ed25519 ...'] [--name internal] [--key-timeout 秒] [--system]
+  ./setup.sh check    [--peer internal] [--alias internal] [--count 20] [--size 10]
 
-  公钥默认由 VPS 通过 Tailscale 文件传输(Taildrop)自动发给 internal;--pubkey 仅作手动备选
-
-  internal 默认无需 root/sudo: tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge
-  --system    改为系统级安装(需要 root/sudo): 安装软件包、systemd 服务、TUN 网卡
+  vps       在 VPS 上运行(需 root/sudo):装 Tailscale、生成专用密钥、等待内部服务器、写 ssh 别名,最后自动测网络质量
+  internal  在内部服务器上运行(默认无需 root/sudo,tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge)
+            --pubkey 为 VPS 打印的公钥;省略则尝试经 Taildrop 接收
+            --system 改为系统级安装(需 root/sudo)
+  check     网络质量测试(路径/延迟/丢包/SSH 往返/吞吐),可随时在 VPS 上重跑
 
 环境变量:
   TS_AUTHKEY        Tailscale auth key(可选,免浏览器登录)
@@ -92,7 +97,11 @@ backend_state() {
 }
 
 tailscale_login() {
-  local name="$1"
+  local name="$1" st i
+  for i in $(seq 1 10); do   # 刚(重)启动的 tailscaled 会短暂处于 NoState/Starting
+    st="$(backend_state)"
+    case "$st" in NoState|Starting|"") sleep 1;; *) break;; esac
+  done
   if [[ "$(backend_state)" == "Running" ]]; then
     log "tailscale 已登录,设置主机名为 $name"
     ts set --hostname="$name" || true
@@ -123,7 +132,7 @@ for p in (d.get("Peer") or {}).values():
 
 # ---------- VPS ----------
 cmd_vps() {
-  local name="vps" peer="internal" user="" alias="internal" timeout=0
+  local name="vps" peer="internal" user="" alias="internal" timeout=0 do_check=1
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="$2"; shift 2;;
@@ -131,6 +140,7 @@ cmd_vps() {
       --user) user="$2"; shift 2;;
       --alias) alias="$2"; shift 2;;
       --timeout) timeout="$2"; shift 2;;
+      --no-check) do_check=0; shift;;
       -h|--help) usage; exit 0;;
       *) die "未知参数: $1";;
     esac
@@ -154,14 +164,14 @@ cmd_vps() {
   fi
   local pub; pub="$(cat "$key.pub")"
 
+  local repo; repo="$(repo_url)"
   cat <<EOF
 
-================ 下一步:在【内部服务器】上执行 ================
-  git clone <本仓库地址> && cd tailnet-bridge
-  ./setup.sh internal --name $peer
-==============================================================
-公钥会自动通过 Tailscale 文件传输(Taildrop)发给内部服务器。
-若自动传输不可用,可手动: ./setup.sh internal --name $peer --pubkey '$pub'
+================ 下一步:在【内部服务器】上执行(无需 sudo) ================
+  git clone $repo && cd tailnet-bridge
+  ./setup.sh internal --name $peer --pubkey '$pub'
+===========================================================================
+(内部服务器上的 Tailscale 需登录到与本机相同的账号;登录链接会在那边的终端打印)
 
 EOF
   log "等待内部服务器 \"$peer\" 加入 tailnet 并可 SSH 登录(用户 $user)... Ctrl-C 可中止,重跑本命令即可继续"
@@ -181,21 +191,15 @@ EOF
         break
       fi
       msg="⏳ $peer 在线($ip),SSH 尚不可用: $(tail -1 <<<"$err")"
-      # 每约 15 秒通过 Taildrop 发一次公钥(内部服务器收到后会自动授权)
-      if (( tick++ % 3 == 0 )); then
-        if serr="$(ts file cp "$sendf" "$peer:" 2>&1)"; then
-          msg="$msg(已通过 Taildrop 发送公钥)"
-        else
-          msg="$msg(Taildrop 发送失败: $(tail -1 <<<"$serr"))"
-        fi
-      fi
-      # Taildrop 不可用且服务器允许密码登录时,交互式用密码一次性写入公钥
-      if (( asked == 0 )) && [[ -t 0 && -n "${serr:-}" && "$err" == *"Permission denied"* && "$err" == *password* ]]; then
+      # 尽力而为: 每约 15 秒经 Taildrop 发一次公钥(失败不提示;内部服务器未带 --pubkey 时可据此自动授权)
+      if (( tick++ % 3 == 0 )); then ts file cp "$sendf" "$peer:" >/dev/null 2>&1 || true; fi
+      # 约 1 分钟仍被拒绝且服务器允许密码登录: 询问是否用密码一次性写入公钥
+      if (( asked == 0 && tick >= 12 )) && [[ -t 0 && "$err" == *"Permission denied"* && "$err" == *password* ]]; then
         asked=1
         log "$msg"; last="$msg"
-        read -r -p "Taildrop 不可用。用 $user@$ip 的登录密码把公钥写入内部服务器? [Y/n] " ans
-        if [[ "${ans:-Y}" =~ ^[Yy] ]]; then
-          push_key_with_password "$user" "$ip" "$key" || warn "密码写入失败,稍后重试或在内部服务器用 --pubkey 手动授权"
+        read -r -p "公钥仍未授权。要用 $user@$ip 的登录密码把公钥直接写入内部服务器吗? [y/N] " ans
+        if [[ "${ans:-N}" =~ ^[Yy] ]]; then
+          push_key_with_password "$user" "$ip" "$key" || warn "密码写入失败,请在内部服务器用 --pubkey 手动授权"
         fi
       fi
     fi
@@ -213,7 +217,99 @@ EOF
   ssh $alias                                  # 登录内部服务器
   ssh -t $alias 'tmux new -As cc'             # 进入 tmux,在里面运行 claude
   ssh -J $alias 用户@虚拟机内网IP              # 经内部服务器跳到 qemu 虚拟机
+  ./setup.sh check                            # 随时重测网络质量
 EOF
+  if (( do_check )); then cmd_check --peer "$peer" --alias "$alias"; fi
+}
+
+# 仓库地址(优先取本地 git remote,转成 https 便于无密钥的内部服务器 clone)
+repo_url() {
+  local u
+  u="$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)"
+  case "$u" in
+    git@github.com:*) u="https://github.com/${u#git@github.com:}";;
+    "") u="$REPO_URL_DEFAULT";;
+  esac
+  echo "$u"
+}
+
+# ---------- 网络质量测试 ----------
+now() { date +%s.%N; }
+fmt_ms() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.0f", (b-a)*1000}'; }
+
+cmd_check() {
+  local peer="internal" alias="internal" count=20 size=10
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --peer) peer="$2"; shift 2;;
+      --alias) alias="$2"; shift 2;;
+      --count) count="$2"; shift 2;;
+      --size) size="$2"; shift 2;;
+      -h|--help) usage; exit 0;;
+      *) die "未知参数: $1";;
+    esac
+  done
+  command -v python3 >/dev/null || die "需要 python3"
+  local state ip; read -r state ip <<<"$(peer_info "$peer")" || true
+  [[ "${state:-}" == "online" && -n "${ip:-}" ]] || die "$peer 不在线,先完成配置或检查对端"
+
+  printf '\n\033[1m========== 网络质量测试: %s (%s) ==========\033[0m\n' "$peer" "$ip"
+
+  # 1) 路径: 直连 / 中继
+  local path path_ok=0
+  path="$(ts status 2>/dev/null | awk -v p="$peer" '$2==p{ $1=$2=$3=$4=""; print }' | sed 's/^ *//' | cut -c1-70)"
+  [[ -n "$path" ]] && printf '路径    : %s\n' "$path"
+  if ts status 2>/dev/null | awk -v p="$peer" '$2==p' | grep -q 'direct'; then path_ok=1; fi
+  local tsping; tsping="$(ts ping -c 3 --timeout 5s "$peer" 2>&1 | tail -1 || true)"
+  [[ -n "$tsping" ]] && printf 'tailscale ping: %s\n' "$tsping"
+
+  # 2) ICMP 延迟 / 丢包 / 抖动
+  local out loss min avg max mdev
+  if command -v ping >/dev/null && out="$(ping -c "$count" -i 0.3 -W 3 "$ip" 2>&1)"; then
+    loss="$(sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p' <<<"$out")"
+    IFS=/ read -r min avg max mdev <<<"$(sed -n 's/.*= \([0-9./]*\) ms.*/\1/p' <<<"$out")"
+    printf '延迟    : 最小 %s / 平均 %s / 最大 %s ms,抖动 %s ms,丢包 %s%%  (%s 个包)\n' \
+      "${min:-?}" "${avg:-?}" "${max:-?}" "${mdev:-?}" "${loss:-?}" "$count"
+  else
+    warn "ping 不可用或全部丢失"; avg=""; loss=100
+  fi
+
+  # 3) SSH 往返: 冷连接(完整握手)与复用连接
+  local t0 t1 i sum_cold=0 sum_warm=0 n=5 cold warm
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlPath=none "$alias" true 2>/dev/null; then
+    for i in $(seq 1 3); do
+      t0=$(now); ssh -o BatchMode=yes -o ControlPath=none "$alias" true; t1=$(now)
+      sum_cold=$(awk -v a="$sum_cold" -v b="$(fmt_ms "$t0" "$t1")" 'BEGIN{print a+b}')
+    done
+    cold=$(awk -v s="$sum_cold" 'BEGIN{printf "%.0f", s/3}')
+    ssh -o BatchMode=yes "$alias" true 2>/dev/null   # 建立复用主连接
+    for i in $(seq 1 $n); do
+      t0=$(now); ssh -o BatchMode=yes "$alias" true; t1=$(now)
+      sum_warm=$(awk -v a="$sum_warm" -v b="$(fmt_ms "$t0" "$t1")" 'BEGIN{print a+b}')
+    done
+    warm=$(awk -v s="$sum_warm" -v n="$n" 'BEGIN{printf "%.0f", s/n}')
+    printf 'SSH     : 新连接 %s ms,复用连接 %s ms(每次执行一条命令的耗时)\n' "$cold" "$warm"
+
+    # 4) 吞吐
+    local up down
+    t0=$(now); head -c "${size}M" /dev/zero | ssh -o BatchMode=yes "$alias" 'cat >/dev/null'; t1=$(now)
+    up=$(awk -v s="$size" -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", s/(b-a)}')
+    t0=$(now); ssh -o BatchMode=yes "$alias" "head -c ${size}M /dev/zero" | cat >/dev/null; t1=$(now)
+    down=$(awk -v s="$size" -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", s/(b-a)}')
+    printf '吞吐    : 上传 %s MB/s,下载 %s MB/s(经 SSH 传 %s MB)\n' "$up" "$down" "$size"
+  else
+    warn "SSH 别名 \"$alias\" 暂不可用,跳过 SSH 与吞吐测试"
+  fi
+
+  # 5) 结论
+  local verdict="未知"
+  if [[ -n "${avg:-}" ]]; then
+    verdict="$(awk -v a="$avg" -v l="${loss:-0}" 'BEGIN{
+      if (l+0 > 5) print "较差(丢包明显)"; else if (a < 50) print "优秀"; else if (a < 120) print "良好";
+      else if (a < 250) print "可用(延迟偏高,交互有明显滞后,不影响后台任务)"; else print "较差(延迟很高)" }')"
+  fi
+  printf '路径类型: %s\n' "$( ((path_ok)) && echo '直连(点对点,无中继)' || echo '中继或未直连(通常几分钟后自动升级为直连)' )"
+  printf '\033[1m结论    : %s\033[0m\n\n' "$verdict"
 }
 
 # 生成在内部服务器上执行的"幂等写入 authorized_keys"命令
@@ -482,6 +578,7 @@ main() {
   case "$sub" in
     vps) cmd_vps "$@";;
     internal) cmd_internal "$@";;
+    check) cmd_check "$@";;
     -h|--help|help) usage;;
     *) usage; exit 1;;
   esac

@@ -1,73 +1,87 @@
 # tailnet-bridge
 
-用 Tailscale 把 **VPS** 与**内部服务器**连起来,内部服务器不暴露任何公网端口。
+用 Tailscale 把 **VPS** 和**内部服务器**连起来,内部服务器不暴露任何公网端口。
 之后在 VPS 上 `ssh internal` 即可;推荐在内部服务器的 tmux 里运行 Claude Code。
 
-## 使用
+| | VPS | 内部服务器 |
+|---|---|---|
+| 权限 | 需要 root/sudo | **不需要** root/sudo |
+| 命令 | `./setup.sh vps` | `./setup.sh internal --pubkey '...'` |
 
-**1. VPS 上**
+## 一次配好(3 步)
+
+**前提**:两台机器能访问外网;有一个 Tailscale 账号(两边登录**同一个**账号);内部服务器已有 `curl`、`python3`、`sshd`。
+
+### 1. VPS 上
 
 ```bash
-git clone <本仓库> && cd tailnet-bridge
+git clone https://github.com/Johnny-Sun-Git/tailnet-bridge.git && cd tailnet-bridge
 ./setup.sh vps
 ```
 
-脚本会:安装并登录 Tailscale → 生成专用 SSH 密钥 → 打印要在内部服务器执行的命令 → **等待内部服务器连通**。
+按提示输入「内部服务器上的登录用户名」。脚本会安装并登录 Tailscale(终端打印授权链接,在浏览器打开),
+生成专用 SSH 密钥,然后**打印一条要在内部服务器执行的完整命令(已含公钥)**,并停在那里等待。
 
-**2. 内部服务器上**(不需要 root/sudo)
+### 2. 内部服务器上
+
+把 VPS 打印的命令整段复制过来执行,形如:
 
 ```bash
-git clone <本仓库> && cd tailnet-bridge
-./setup.sh internal
+git clone https://github.com/Johnny-Sun-Git/tailnet-bridge.git && cd tailnet-bridge
+./setup.sh internal --name internal --pubkey 'ssh-ed25519 AAAA...'
 ```
 
-脚本会:下载并登录 Tailscale(无 root 的 userspace 模式)→ 把 tailnet:22 转发到本机 sshd → **自动接收 VPS 发来的公钥并授权**。
-公钥通过 Tailscale 文件传输(Taildrop)从 VPS 自动送达,无需复制粘贴;两台机器须登录同一个账号。
-Taildrop 不可用时,VPS 会询问是否用内部服务器账号的登录密码一次性写入公钥(需要内部 sshd 允许密码登录),也可手动:`./setup.sh internal --pubkey 'ssh-ed25519 AAAA...'`(VPS 会把这条命令打印出来)。
+终端同样会打印 Tailscale 授权链接,在浏览器打开并登录**同一个账号**。脚本会自动:
+下载 tailscale 到 `~/.local/share/tailnet-bridge`(userspace 模式,无需 root)→ 把 tailnet:22 转发到本机 sshd → 授权 VPS 公钥。
 
-**3. 回到 VPS**:检测到连通后自动写入 `~/.ssh/config`,然后:
+### 3. 回到 VPS
+
+等待中的脚本检测到连通后,自动写入 `~/.ssh/config`,并**自动做网络质量测试**。之后:
 
 ```bash
 ssh internal
 ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 ```
 
-两边的 Tailscale 登录都会打印一个授权链接,在任意浏览器打开、登录**同一个账号**即可。
-也可预先 `export TS_AUTHKEY=tskey-...` 免浏览器。
+## 网络质量测试
+
+`setup.sh vps` 完成时会自动运行,也可随时重测:
+
+```bash
+./setup.sh check                       # 默认: 20 个 ping、传 10MB
+./setup.sh check --count 50 --size 50  # 更久、更准
+```
+
+输出内容:路径(直连/中继)、延迟(最小/平均/最大/抖动)、丢包、SSH 新连接与复用连接耗时、上传/下载吞吐,以及结论。
+参考(同一条链路的实测):直连、平均 236ms、抖动 0.4ms、0% 丢包;SSH 新连接约 2.7s、复用连接约 0.5s——
+延迟由物理距离决定,抖动和丢包才反映链路是否稳定。
 
 ## 选项
 
 | 命令 | 参数 |
 |---|---|
-| `setup.sh vps` | `--name vps` 本机 tailnet 名 · `--peer internal` 等待的对端名 · `--user` 内部服务器用户名 · `--alias internal` ssh 别名 · `--timeout 秒` |
-| `setup.sh internal` | `--name internal` · `--pubkey '...'` 手动提供公钥(默认经 Taildrop 自动接收) · `--key-timeout 秒` 等公钥的时长 · `--user` 授权给哪个本地用户(默认当前用户) · `--system` 系统级安装(需 root/sudo;默认无需 root) |
+| `vps` | `--user` 内部服务器用户名 · `--name vps` 本机 tailnet 名 · `--peer internal` 等待的对端名 · `--alias internal` ssh 别名 · `--timeout 秒` · `--no-check` 跳过测试 |
+| `internal` | `--pubkey '...'` VPS 打印的公钥 · `--name internal` · `--key-timeout 秒` · `--system` 系统级安装(需 root/sudo) |
+| `check` | `--peer` · `--alias` · `--count` ping 次数 · `--size` 传输 MB 数 |
 
-自建 Headscale:`export TS_LOGIN_SERVER=https://headscale.example.com` 后再运行。
-脚本可重复执行(幂等)。
+环境变量:`TS_AUTHKEY=tskey-...` 免浏览器登录;`TS_LOGIN_SERVER=https://...` 使用自建 Headscale。
+所有命令可重复执行(幂等)。
 
-## 无 root 模式(internal 默认)
+## 工作原理
 
-`setup.sh internal` 默认**不需要 root/sudo**:
-
-```bash
-./setup.sh internal --pubkey 'ssh-ed25519 AAAA...'
-```
-
-- 下载 tailscale 静态二进制到 `~/.local/share/tailnet-bridge`,以 **userspace 网络模式**运行(无需 TUN/root)。
-- 后台服务优先用 `systemd --user`(并尝试 `loginctl enable-linger`),不可用则退回 `nohup`(重启后需重跑脚本)。
-- 通过 `tailscale serve` 把 tailnet:22 转发到本机:本机 sshd 在 22 端口则直接转发,否则自己起一个仅监听 127.0.0.1:2222 的用户态 sshd。
-- 公钥的来源限制为回环地址(`from="127.0.0.1,::1"`),因为转发后 sshd 看到的来源是本机。
-- 前提:机器上已有 `curl`、`python3`,以及(若系统 sshd 未运行)`/usr/sbin/sshd`;`tmux` 缺失只会提示。
-- 有 root/sudo 且想要系统级安装(TUN 网卡、系统服务、自动装 sshd/tmux)时加 `--system`。
-- VPS 端仍用 `./setup.sh vps`(VPS 需要 root/sudo)。
-
-## 安全说明
-
-- 内部服务器只做出站连接,公网上看不到它;内网 IP 不会公开(tailnet 内使用 100.x 虚拟地址)。
+- 内部服务器只做出站连接,公网上看不到它;内网 IP 不会公开(tailnet 内用 100.x 虚拟地址)。
+- 内部服务器无 root:tailscaled 以 userspace 模式运行(优先 `systemd --user` + linger,否则 `nohup`),
+  `tailscale serve` 把 tailnet:22 转发到本机 sshd(本机没有 sshd 在 22 时,自起仅监听 127.0.0.1:2222 的用户态 sshd)。
+- 授权的公钥带来源限制:无 root 时 `from="127.0.0.1,::1"`(转发后来源是本机);`--system` 时 `from="100.64.0.0/10,..."`。
+- 私钥始终留在 VPS(`~/.ssh/id_ed25519_tailnet-bridge`,无口令,便于 Claude Code 自动化,请只用于此用途),不会传输。
 - Tailscale 控制面能看到设备名、账号、出口 IP 等元数据,看不到流量内容。要完全自控请用 Headscale。
-- 授权的公钥带有 `from="100.64.0.0/10,..."`,即使泄露也只能在 tailnet 内使用。
-- 公钥经 Taildrop 只在你自己的设备间传输,且只接受名为 `tnb-*.pub`、格式合法的公钥文件;私钥始终留在 VPS,不会传输。
-- VPS 专用密钥 `~/.ssh/id_ed25519_tailnet-bridge` 无口令,便于 Claude Code 自动化,请只用于此用途。
+
+## 公钥怎么到内部服务器
+
+默认就是上面「命令里带 `--pubkey`」,最可靠。另外还有两条自动兜底(尽力而为,依赖环境):
+
+- 内部服务器省略 `--pubkey` 时,会等待 VPS 经 Tailscale 文件传输(Taildrop)发来公钥。
+- VPS 等待约 1 分钟仍被拒绝、且内部 sshd 允许密码登录时,会询问是否用内部账号的密码一次性写入公钥。
 
 ## qemu 虚拟机
 
@@ -82,6 +96,9 @@ Host vm1
 
 ## 排查
 
-- 脚本卡在 "尚未出现在 tailnet":内部服务器的 Tailscale 还没登录,或登录了不同账号;若主机名冲突会变成 `internal-1`,用 `--peer internal-1`。
-- "在线,SSH 尚不可用":用户名不一致(用 `--user`),或 sshd 未运行,或公钥未授权。
-- 查看路径与延迟:`tailscale status`(direct / relay)、`tailscale ping internal`。
+- 停在「尚未出现在 tailnet」:内部服务器的 Tailscale 还没登录,或登录了不同账号;主机名冲突会变成 `internal-1`,用 `--peer internal-1`。
+- 「在线,SSH 尚不可用: Permission denied」:公钥还没授权(在内部服务器执行 VPS 打印的命令),或 `--user` 用户名不一致。
+- 「Connection timed out」:内部服务器上的转发还没配好(正在执行 `setup.sh internal` 时是正常的)。
+- 内部服务器没有 `tmux`:无 root 无法代装,请让管理员安装,或直接 `ssh internal` 后运行。
+- 内部服务器重启后连不上:无 `systemd --user`/linger 时需要重跑一次 `./setup.sh internal --pubkey ...`。
+- 延迟高:`tailscale ping internal` 看是直连还是 DERP 中继;直连时延迟即物理链路延迟。
