@@ -10,7 +10,7 @@
 
 ## 一次配好(3 步)
 
-**前提**:两台机器能访问外网;有一个 Tailscale 账号(两边登录**同一个**账号);内部服务器已有 `curl`、`python3`、`sshd`。
+**前提**:两台机器能访问外网;有一个 Tailscale 账号(两边登录**同一个**账号);内部服务器已有 `curl`/`wget`、`tar`、`git`、`sshd`。
 
 ### 1. VPS 上
 
@@ -22,17 +22,25 @@ git clone https://github.com/Johnny-Sun-Git/tailnet-bridge.git && cd tailnet-bri
 按提示输入「内部服务器上的登录用户名」。脚本会安装并登录 Tailscale(终端打印授权链接,在浏览器打开),
 生成专用 SSH 密钥,然后**打印一条要在内部服务器执行的完整命令(已含公钥)**,并停在那里等待。
 
-### 2. 内部服务器上
+### 2. 内部服务器上(无需 root/sudo)
 
-把 VPS 打印的命令整段复制过来执行,形如:
+VPS 会打印一个**粘贴块**(同时保存在 VPS 的 `~/tailnet-bridge-internal.txt`,随时 `cat` 重看)。
+**整段原样复制,粘贴到内部服务器终端回车**,不用改任何东西。形如:
 
 ```bash
-git clone https://github.com/Johnny-Sun-Git/tailnet-bridge.git && cd tailnet-bridge
-./setup.sh internal --name internal --pubkey 'ssh-ed25519 AAAA...'
+mkdir -p ~/.cache && cat > ~/.cache/tnb-vps.pub <<'TNB_KEY'
+ssh-ed25519 AAAA... tailnet-bridge@vps
+TNB_KEY
+git -C ~/tailnet-bridge pull -q 2>/dev/null || git clone -q https://github.com/Johnny-Sun-Git/tailnet-bridge.git ~/tailnet-bridge
+cd ~/tailnet-bridge && ./setup.sh internal --name internal --pubkey-file ~/.cache/tnb-vps.pub
 ```
 
-终端同样会打印 Tailscale 授权链接,在浏览器打开并登录**同一个账号**。脚本会自动:
-下载 tailscale 到 `~/.local/share/tailnet-bridge`(userspace 模式,无需 root)→ 把 tailnet:22 转发到本机 sshd → 授权 VPS 公钥。
+公钥通过 heredoc 写入文件,不会有引号/长行问题;脚本还会校验公钥完整性(复制被截断会明确报错)。
+终端会打印 Tailscale 授权链接,在浏览器打开并登录**同一个账号**。脚本会自动:
+下载 tailscale 到 `~/.local/share/tailnet-bridge`(userspace 模式)→ 把 tailnet:22 转发到本机 sshd → 授权 VPS 公钥。
+
+**内部服务器只需要**:`curl`(或 `wget`)、`tar`、`git`、已有的 `sshd`(或 `/usr/sbin/sshd`)。
+**不需要** root、sudo、python3,也不会安装任何系统软件包。
 
 ### 3. 回到 VPS
 
@@ -61,7 +69,7 @@ ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 | 命令 | 参数 |
 |---|---|
 | `vps` | `--user` 内部服务器用户名 · `--name vps` 本机 tailnet 名 · `--peer internal` 等待的对端名 · `--alias internal` ssh 别名 · `--timeout 秒` · `--no-check` 跳过测试 |
-| `internal` | `--pubkey '...'` VPS 打印的公钥 · `--name internal` · `--key-timeout 秒` · `--system` 系统级安装(需 root/sudo) |
+| `internal` | `--pubkey-file 文件` 或 `--pubkey '...'` VPS 打印的公钥 · `--name internal` · `--key-timeout 秒` · `--system` 系统级安装(需 root/sudo) |
 | `check` | `--peer` · `--alias` · `--count` ping 次数 · `--size` 传输 MB 数 |
 
 环境变量:`TS_AUTHKEY=tskey-...` 免浏览器登录;`TS_LOGIN_SERVER=https://...` 使用自建 Headscale。
@@ -78,7 +86,7 @@ ssh -t internal 'tmux new -As cc'    # 在 tmux 里跑 claude,断线不丢任务
 
 ## 公钥怎么到内部服务器
 
-默认就是上面「命令里带 `--pubkey`」,最可靠。另外还有两条自动兜底(尽力而为,依赖环境):
+默认就是上面「粘贴块里带公钥」,最可靠。另外还有两条自动兜底(尽力而为,依赖环境):
 
 - 内部服务器省略 `--pubkey` 时,会等待 VPS 经 Tailscale 文件传输(Taildrop)发来公钥。
 - VPS 等待约 1 分钟仍被拒绝、且内部 sshd 允许密码登录时,会询问是否用内部账号的密码一次性写入公钥。
@@ -97,7 +105,7 @@ Host vm1
 ## 排查
 
 - 停在「尚未出现在 tailnet」:内部服务器的 Tailscale 还没登录,或登录了不同账号;主机名冲突会变成 `internal-1`,用 `--peer internal-1`。
-- 「在线,SSH 尚不可用: Permission denied」:公钥还没授权(在内部服务器执行 VPS 打印的命令),或 `--user` 用户名不一致。
+- 「在线,SSH 尚不可用: Permission denied」:公钥还没授权(在内部服务器粘贴 VPS 打印的那一段),或 `--user` 用户名不一致。
 - 「Connection timed out」:内部服务器上的转发还没配好(正在执行 `setup.sh internal` 时是正常的)。
 - 内部服务器没有 `tmux`:无 root 无法代装,请让管理员安装,或直接 `ssh internal` 后运行。
 - 内部服务器重启后连不上:无 `systemd --user`/linger 时需要重跑一次 `./setup.sh internal --pubkey ...`。

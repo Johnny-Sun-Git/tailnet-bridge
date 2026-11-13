@@ -39,12 +39,12 @@ usage() {
 用法:
   ./setup.sh vps      [--user 内部服务器用户名] [--name vps] [--peer internal] [--alias internal]
                       [--timeout 秒] [--no-check]
-  ./setup.sh internal [--pubkey 'ssh-ed25519 ...'] [--name internal] [--key-timeout 秒] [--system]
+  ./setup.sh internal [--pubkey-file 文件 | --pubkey '...'] [--name internal] [--key-timeout 秒] [--system]
   ./setup.sh check    [--peer internal] [--alias internal] [--count 20] [--size 10]
 
   vps       在 VPS 上运行(需 root/sudo):装 Tailscale、生成专用密钥、等待内部服务器、写 ssh 别名,最后自动测网络质量
   internal  在内部服务器上运行(默认无需 root/sudo,tailscale 以 userspace 模式运行在 ~/.local/share/tailnet-bridge)
-            --pubkey 为 VPS 打印的公钥;省略则尝试经 Taildrop 接收
+            公钥来自 VPS 打印的粘贴块(整段复制即可);省略则尝试经 Taildrop 接收
             --system 改为系统级安装(需 root/sudo)
   check     网络质量测试(路径/延迟/丢包/SSH 往返/吞吐),可随时在 VPS 上重跑
 
@@ -64,12 +64,24 @@ pkg_install() {
   else die "未识别的包管理器,请手动安装: $*"; fi
 }
 
+# 下载: curl 优先,其次 wget(无 root 时无法安装软件,缺什么就明确报出来)
+fetch() { # fetch URL [输出文件]
+  if command -v curl >/dev/null; then
+    if [[ -n "${2:-}" ]]; then curl -fsSL "$1" -o "$2"; else curl -fsSL "$1"; fi
+  else
+    if [[ -n "${2:-}" ]]; then wget -q "$1" -O "$2"; else wget -qO- "$1"; fi
+  fi
+}
+
 need_basics() {
+  if (( ROOTLESS )); then
+    command -v curl >/dev/null || command -v wget >/dev/null || die "缺少 curl 或 wget(无 root 模式无法安装软件,请让管理员安装,或改用 --system)"
+    command -v tar >/dev/null || die "缺少 tar"
+    return 0
+  fi
   local c
   for c in curl python3; do
-    command -v "$c" >/dev/null && continue
-    (( ROOTLESS )) && die "无 root 模式无法安装软件,请先让管理员安装: $c(或改用 --system)"
-    pkg_install "$c"
+    command -v "$c" >/dev/null || pkg_install "$c"
   done
 }
 
@@ -93,7 +105,7 @@ install_tailscale() {
 }
 
 backend_state() {
-  ts status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true
+  ts status --json 2>/dev/null | grep -o '"BackendState": *"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/' || true
 }
 
 tailscale_login() {
@@ -164,14 +176,17 @@ cmd_vps() {
   fi
   local pub; pub="$(cat "$key.pub")"
 
-  local repo; repo="$(repo_url)"
+  local paste="$HOME/tailnet-bridge-internal.txt"
+  internal_paste_block "$peer" "$pub" >"$paste"
   cat <<EOF
 
-================ 下一步:在【内部服务器】上执行(无需 sudo) ================
-  git clone $repo && cd tailnet-bridge
-  ./setup.sh internal --name $peer --pubkey '$pub'
-===========================================================================
-(内部服务器上的 Tailscale 需登录到与本机相同的账号;登录链接会在那边的终端打印)
+================ 下一步:在【内部服务器】上执行(无需 root/sudo) ================
+把下面两条横线之间的内容【整段原样复制】,粘贴到内部服务器终端回车即可(无需编辑任何内容):
+-----------------------------------------------------------------------------
+$(cat "$paste")
+-----------------------------------------------------------------------------
+(随时可重看: cat $paste)
+内部服务器的 Tailscale 登录链接会在那边的终端打印,请用与本机相同的账号授权。
 
 EOF
   log "等待内部服务器 \"$peer\" 加入 tailnet 并可 SSH 登录(用户 $user)... Ctrl-C 可中止,重跑本命令即可继续"
@@ -220,6 +235,18 @@ EOF
   ./setup.sh check                            # 随时重测网络质量
 EOF
   if (( do_check )); then cmd_check --peer "$peer" --alias "$alias"; fi
+}
+
+# 生成"整段复制即用"的内部服务器脚本: 公钥用 heredoc 写入文件,避免引号/换行问题
+internal_paste_block() {
+  local peer="$1" pub="$2" repo; repo="$(repo_url)"
+  cat <<BLOCK
+mkdir -p ~/.cache && cat > ~/.cache/tnb-vps.pub <<'TNB_KEY'
+$pub
+TNB_KEY
+git -C ~/tailnet-bridge pull -q 2>/dev/null || git clone -q $repo ~/tailnet-bridge
+cd ~/tailnet-bridge && ./setup.sh internal --name $peer --pubkey-file ~/.cache/tnb-vps.pub
+BLOCK
 }
 
 # 仓库地址(优先取本地 git remote,转成 https 便于无密钥的内部服务器 clone)
@@ -363,12 +390,13 @@ EOF
 
 # ---------- 内部服务器 ----------
 cmd_internal() {
-  local name="internal" pubkey="" user="" key_timeout=1800
+  local name="internal" pubkey="" pubkey_file="" user="" key_timeout=1800
   ROOTLESS=1   # 默认无 root
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="$2"; shift 2;;
       --pubkey) pubkey="$2"; shift 2;;
+      --pubkey-file) pubkey_file="$2"; shift 2;;
       --user) user="$2"; shift 2;;
       --key-timeout) key_timeout="$2"; shift 2;;
       --system) ROOTLESS=0; shift;;
@@ -401,6 +429,10 @@ cmd_internal() {
     command -v tmux >/dev/null || { log "安装 tmux"; pkg_install tmux || warn "tmux 安装失败,请手动安装"; }
   fi
 
+  if [[ -z "$pubkey" && -n "$pubkey_file" ]]; then
+    [[ -f "$pubkey_file" ]] || die "找不到公钥文件: $pubkey_file"
+    pubkey="$(tr -d '\r\n' <"$pubkey_file")"   # 容忍复制时多出的换行
+  fi
   if [[ -z "$pubkey" ]]; then
     pubkey="$(receive_pubkey "$key_timeout")" || true
   fi
@@ -433,7 +465,11 @@ ensure_sshd() {
 
 authorize_key() {
   local user="$1" key="$2" from="${3:-$TAILNET_FROM}" home dir file blob
-  [[ "$key" =~ ^(ssh-|ecdsa-|sk-) ]] || die "公钥格式不正确"
+  [[ "$key" =~ ^(ssh-|ecdsa-|sk-) ]] || die "公钥格式不正确(应以 ssh-ed25519 开头)"
+  if command -v ssh-keygen >/dev/null; then
+    printf '%s\n' "$key" | ssh-keygen -l -f - >/dev/null 2>&1 \
+      || die "公钥不完整或已损坏(复制时被换行/截断了?)。请回 VPS 重新复制整段命令"
+  fi
   home="$(getent passwd "$user" | cut -d: -f6)"
   dir="$home/.ssh"; file="$dir/authorized_keys"
   blob="$(awk '{print $2}' <<<"$key")"
@@ -510,11 +546,11 @@ rootless_install_tailscale() {
     *) die "不支持的架构: $(uname -m)";;
   esac
   log "下载 tailscale 静态二进制 ($arch) ..."
-  meta="$(curl -fsSL 'https://pkgs.tailscale.com/stable/?mode=json')" || die "无法获取 tailscale 版本信息"
-  file="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["Tarballs"][sys.argv[1]])' "$arch" <<<"$meta")" \
-    || die "找不到适用于 $arch 的 tailscale 压缩包"
+  meta="$(fetch 'https://pkgs.tailscale.com/stable/?mode=json')" || die "无法获取 tailscale 版本信息"
+  file="$(grep -o "tailscale_[0-9.]*_${arch}\.tgz" <<<"$meta" | head -1)"
+  [[ -n "$file" ]] || die "找不到适用于 $arch 的 tailscale 压缩包"
   tmp="$(mktemp -d)"
-  curl -fsSL "https://pkgs.tailscale.com/stable/$file" -o "$tmp/ts.tgz" || die "下载失败"
+  fetch "https://pkgs.tailscale.com/stable/$file" "$tmp/ts.tgz" || die "下载失败"
   mkdir "$tmp/x" && tar -xzf "$tmp/ts.tgz" --strip-components=1 -C "$tmp/x"
   install -m 755 "$tmp/x/tailscale" "$tmp/x/tailscaled" "$RL_DIR/bin/"
   rm -rf "$tmp"
